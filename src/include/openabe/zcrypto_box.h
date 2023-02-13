@@ -151,8 +151,12 @@ public:
   void keygen(const std::string key_id);
   bool encrypt(const std::string receiver_id, const std::string &plaintext,
                std::string &ciphertext);
+  bool encryptMulti(const std::vector<std::string> &receiver_ids,
+               const std::string &plaintext, std::string &ciphertext);
   bool decrypt(const std::string receiver_id, const std::string &ciphertext,
                std::string &plaintext);
+//  bool decryptMulti(const std::string receiver_id, const std::string &ciphertext,
+//               std::string &plaintext);
 
 private:
   std::unique_ptr<OpenABEContextSchemePKE> schemeContext_;

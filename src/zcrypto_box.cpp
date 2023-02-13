@@ -457,6 +457,37 @@ bool OpenPKEContext::encrypt(const string receiver_id, const string &plaintext,
   return true;
 }
 
+bool OpenPKEContext::encryptMulti(const std::vector<std::string> &receiver_ids,
+                         const string &plaintext, string &ciphertext) {
+  OpenABE_ERROR result;
+  OpenABECiphertext ct;
+  OpenABEByteString ct_buf;
+
+  if (receiver_ids.empty())
+    throw ZCryptoBoxException("encrypt: receiver_ids cannot be empty");
+
+  vector<string> inner_receiver_ids;
+  inner_receiver_ids.reserve(receiver_ids.size());
+  for (auto &receiver_id : receiver_ids)
+      inner_receiver_ids.push_back(OpenABE_PK_PREFIX(receiver_id));
+
+  // use receiver id 0 as dummy sender
+  if ((result = schemeContext_->encryptMulti(nullptr, inner_receiver_ids,
+                                        inner_receiver_ids[0], plaintext,
+                                        &ct)) != OpenABE_NOERROR) {
+    throw ZCryptoBoxException("encrypt: " + string(OpenABE_errorToString(result)));
+  }
+
+  ct.exportToBytes(ct_buf);
+  if (base64Encode_) {
+    const string str = ct_buf.toString();
+    ciphertext = Base64Encode((const uint8_t *)str.c_str(), str.size());
+  } else
+    ciphertext = ct_buf.toString();
+
+  return true;
+}
+
 bool OpenPKEContext::decrypt(const string receiver_id, const string &ciphertext,
                          string &plaintext) {
   OpenABE_ERROR result;

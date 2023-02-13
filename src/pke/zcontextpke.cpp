@@ -266,6 +266,127 @@ OpenABEContextOPDH::encryptKEM(OpenABERNG *rng, const string &pkID,
   return result;
 }
 
+
+/*!
+ * Generate and encrypt a symmetric key using the key encapsulation mode
+ * of the scheme. Return the key and ciphertext.
+ *
+ * @param[in]   random number generator to use during encryption (it is optional: could be set to NULL here).
+ * @param[in]	public key identifier in keystore for the recipient (assumes it's already in keystore).
+ * @param[in]   public key UID for sender.
+ * @param[in]   length of the symmetric key.
+ * @param[out]  symmetric key to be returned (must be allocated).
+ * @param[out]	PKE ciphertext (must be allocated).
+ * @return  An error code or OpenABE_NOERROR.
+ */
+
+OpenABE_ERROR
+OpenABEContextOPDH::encryptKEMMulti(OpenABERNG *rng, const vector<string> &pkIDs,
+                           OpenABEByteString *senderID, uint32_t keyBitLen,
+                           const shared_ptr<OpenABESymKey> &key,
+                           OpenABECiphertext *ciphertext) {
+  OpenABE_ERROR result = OpenABE_NOERROR;
+  OpenABERNG *myRNG = this->getRNG();
+  unique_ptr<oabe::crypto::OpenABESymKeyAuthEnc> authEnc = nullptr;
+  OpenABEByteString ctHdr, K, iv, ct, tag;
+  string kStr;
+
+  try {
+    // check inputs
+    ASSERT_NOTNULL(senderID);
+    ASSERT_NOTNULL(ciphertext);
+    ASSERT_NOTNULL(key);
+
+    // check if the RNG has been set or not
+    if (rng != nullptr) {
+      myRNG = rng;
+    }
+    ASSERT_NOTNULL(myRNG);
+
+    // generate a random symmetric key
+    ASSERT(keyBitLen % 8 == 0, OpenABE_ERROR_INVALID_INPUT);
+    myRNG->getRandomBytes(&K, keyBitLen / 8);
+    key->setSymmetricKey(K);
+    kStr = K.toString();
+    // TODO: remove! added for test purposes
+    cout << "K(" << K.size() << "): " << endl << K << endl;
+
+    // select generator of the curve
+    G_t g = this->getECCurve()->getGenerator();
+    // select ephemeral private keyL e <-$- ZP
+    ZP_t e = this->getECCurve()->randomZP(myRNG);
+    // compute ephemeral public key: C = g^e
+    G_t C = g.exp(e);
+    // store C in ciphertext
+    ciphertext->setComponent("C", &C);
+    // set the ciphertext header (curve ID, scheme ID, etc)
+    ciphertext->setHeader(this->getECCurve()->getCurveID(), OpenABE_SCHEME_PK_OPDH,
+                          myRNG);
+    // needed by symmetric encryption
+    ciphertext->getHeader(ctHdr);
+    // use a common key derive function
+    unique_ptr<OpenABEKDF> kdf(new OpenABEKDF);
+
+    for (auto &pkID : pkIDs) {
+      // load the recipient's public key
+      shared_ptr<OpenABEKey> PK = this->getKeystore()->getPublicKey(pkID);
+      if (PK == nullptr)
+        throw OpenABE_ERROR_MISSING_RECEIVER_PUBLIC_KEY;
+
+      // compute P = A ^ e => shared key: g^(a*e)
+      G_t *A = PK->getG_t("A");
+      ASSERT_NOTNULL(A);
+
+      G_t P = A->exp(e);
+      ZP_t x, y;
+      P.get(x, y);
+      OpenABEByteString Z = x.getByteString();
+
+      // compute the metadata
+      OpenABEByteString kdfMetadata;
+      // kdf_metadata required: AlgID || ID_Sender || ID_Recipient
+      kdfMetadata.insertFirstByte(OpenABE_SCHEME_PK_OPDH);
+      kdfMetadata = kdfMetadata + *senderID + PK->getUID();
+      // TODO: remove! added for test purposes
+      cout << "kdfMetaData[" << pkID << "] (" << kdfMetadata.size() << "):" << endl << kdfMetadata << endl;
+
+
+      OpenABEByteString DerivedKeyMaterial =
+          kdf->DeriveKey(Z, keyBitLen, kdfMetadata);
+      // TODO: remove! added for test purposes
+      cout << "DerivedKeyMaterial[" << pkID << "](" << DerivedKeyMaterial.size() << "):" << endl << DerivedKeyMaterial << endl;
+      // this is what it's supposed to be, DerivedKeyMaterial is used as key bytes eventually
+      // we skip this step, use DerivedKeyMaterial directly
+      // // return the derived key material
+      // OpenABESymKey key;
+      // key->setSymmetricKey(DerivedKeyMaterial);
+      // keyBytes = key->getKeyBytes();
+      authEnc.reset(
+          new oabe::crypto::OpenABESymKeyAuthEnc(DEFAULT_AES_SEC_LEVEL, DerivedKeyMaterial));
+      // Embed the header of the ciphertext as AAD
+      authEnc->setAddAuthData(ctHdr);
+      // Encrypt
+      authEnc->encrypt(kStr, &iv, &ct, &tag);
+
+      // Store symmetric ciphertext
+      ciphertext->setComponent("IV_" + pkID, &iv);
+      ciphertext->setComponent("CT_" + pkID, &ct);
+      ciphertext->setComponent("Tag_" + pkID, &tag);
+
+      // clear memory
+      DerivedKeyMaterial.zeroize();
+      kdfMetadata.clear();
+      Z.clear();
+    }
+  } catch (OpenABE_ERROR &err) {
+    result = err;
+  }
+  // clear memory
+  K.zeroize();
+  kStr.clear();
+  return result;
+}
+
 /*!
  * Decrypt a symmetric key using the key encapsulation mode
  * of the scheme. Return the key.
@@ -644,6 +765,74 @@ OpenABEContextSchemePKE::encrypt(OpenABERNG *rng, const string &pkID,
 
     // Instantiate an auth enc scheme with the symmetric key
     keyBytes = key->getKeyBytes();
+    authEnc.reset(
+        new oabe::crypto::OpenABESymKeyAuthEnc(DEFAULT_AES_SEC_LEVEL, keyBytes));
+    // Obtain header from ciphertext
+    ciphertext->getHeader(ctHdr);
+    // Embed the header of the ciphertext as AAD
+    authEnc->setAddAuthData(ctHdr);
+    // Encrypt
+    authEnc->encrypt(plaintext, &iv, &ct, &tag);
+    // Store symmetric ciphertext
+    ciphertext->setComponent("IV", &iv);
+    ciphertext->setComponent("CT", &ct);
+    ciphertext->setComponent("Tag", &tag);
+  } catch (OpenABE_ERROR &error) {
+    result = error;
+  }
+
+  key->zeroize();
+  keyBytes.zeroize();
+  return result;
+}
+
+/*!
+ * Generate and encrypt a symmetric key using the key encapsulation mode
+ * of the underlying scheme. Use the symmetric key with AES-GCM to encrypt
+ * the plaintext. Return the ciphertext.
+ *
+ * @param[in]   random number generator to use during encryption (it is optional: could be set to NULL here).
+ * @param[in]	public key identifier in keystore for the recipient (assumes it's already in keystore).
+ * @param[in]   public key UID for sender.
+ * @param[in]   the plaintext.
+ * @param[out]	PKE ciphertext (must be allocated).
+ * @return  An error code or OpenABE_NOERROR.
+ */
+OpenABE_ERROR
+OpenABEContextSchemePKE::encryptMulti(OpenABERNG *rng, const vector<string> &pkIDs,
+                             const string &senderpkID, const string &plaintext,
+                             OpenABECiphertext *ciphertext) {
+  OpenABE_ERROR result = OpenABE_NOERROR;
+
+  shared_ptr<OpenABEKey> senderPK = nullptr;
+  OpenABEByteString senderID, keyBytes, ctHdr, iv, ct, tag;
+  shared_ptr<OpenABESymKey> key(new OpenABESymKey);
+
+  unique_ptr<oabe::crypto::OpenABESymKeyAuthEnc> authEnc = nullptr;
+
+  try {
+    ASSERT_NOTNULL(ciphertext);
+    // make sure plaintext size > 0
+    ASSERT(plaintext.size() > 0, OpenABE_ERROR_NO_PLAINTEXT_SPECIFIED);
+
+    // Get PK of sender (assumes it has already been loaded)
+    senderPK = this->m_KEM_->getKeystore()->getPublicKey(senderpkID);
+    if (senderPK == nullptr) {
+      throw OpenABE_ERROR_MISSING_SENDER_PUBLIC_KEY;
+    }
+    senderID = senderPK->getUID();
+
+    // Returns a ciphertext and (a symmetric key for each pkID)
+    result = this->m_KEM_->encryptKEMMulti(rng, pkIDs, &senderID,
+                                      DEFAULT_SYM_KEY_BITS, key, ciphertext);
+
+    // Propagate errors from encryptKEM
+    ASSERT(result == OpenABE_NOERROR, result);
+
+    // Instantiate an auth enc scheme with the symmetric key
+    keyBytes = key->getKeyBytes();
+    // TODO: remove! added for test purposes
+    cout << "keyBytes(" << keyBytes.size() << "): " << endl << keyBytes << endl;
     authEnc.reset(
         new oabe::crypto::OpenABESymKeyAuthEnc(DEFAULT_AES_SEC_LEVEL, keyBytes));
     // Obtain header from ciphertext
